@@ -60,20 +60,23 @@ def main(cfg: TrainConfig):
         llm_variant=cfg.model.language_model.variant,
         predict=False
     )
+    cfg.model.vision_model.use_global_img = cfg.data_module.use_global_img
     model = hydra.utils.instantiate(
         cfg.model,
-        route_as=cfg.data_module.route_as, 
-        vision_model={
-            "use_global_img": cfg.data_module.use_global_img,
-            }
-        )
+        route_as=cfg.data_module.route_as
+    )
 
     if cfg.checkpoint is not None:
         if os.path.isdir(cfg.checkpoint):
             state_dict = get_fp32_state_dict_from_zero_checkpoint(cfg.checkpoint)
         else:
-            state_dict = torch.load(cfg.checkpoint, map_location="cpu")
-        model.load_state_dict(state_dict)
+            ckpt = torch.load(cfg.checkpoint, map_location="cpu")
+            state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"[Checkpoint Load] Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
 
         
     # print config
