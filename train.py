@@ -8,13 +8,38 @@ from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelSummary, ThroughputMonitor
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger, WandbLogger
-from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
-from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
-from lightning.pytorch.strategies.fsdp import FSDPStrategy as _FSDP
 
 from simlingo_base_training.callbacks.visualise import VisualiseCallback
 from simlingo_base_training.config import TrainConfig
 from simlingo_base_training.utils.logging_project import setup_logging
+
+class SimlingoCompatibleCheckpoint(pl.Callback):
+    def __init__(self, dirpath="./checkpoints", every_n_epochs=1, save_last=True):
+        super().__init__()
+        self.dirpath = dirpath
+        self.every = every_n_epochs
+        self.save_last = save_last
+        os.makedirs(self.dirpath, exist_ok=True)
+
+    def _dump(self, trainer: pl.Trainer, pl_module: pl.LightningModule, filename: str):
+        ckpt = {
+            "state_dict": pl_module.state_dict(),
+            "epoch": int(trainer.current_epoch),
+            "global_step": int(trainer.global_step),
+            "pytorch-lightning_version": pl.__version__,
+        }
+        path = os.path.join(self.dirpath, filename)
+        torch.save(ckpt, path)
+        if trainer.is_global_zero:
+            print(f"[SimlingoCompatibleCheckpoint] saved -> {path}")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        if (trainer.current_epoch + 1) % self.every == 0:
+            self._dump(trainer, pl_module, f"epoch={trainer.current_epoch:03d}.ckpt")
+        if self.save_last:
+            self._dump(trainer, pl_module, "last.ckpt")
 
 @hydra.main(config_path=f"config", config_name="config", version_base="1.1")
 def main(cfg: TrainConfig):
@@ -55,8 +80,9 @@ def main(cfg: TrainConfig):
     print(OmegaConf.to_yaml(cfg))
     os.environ["WANDB_DISABLE_CODE"] = "True"
     
-    overfit = cfg.overfit if cfg.overfit > 0 else 0
-
+    if cfg.overfit > 0:
+        overfit = cfg.overfit
+        
     # setup logging
     setup_logging(cfg)
 
@@ -95,55 +121,31 @@ def main(cfg: TrainConfig):
         loggers.append(wandblogger)
 
     strategy = cfg.strategy
-    
     if strategy == "deepspeed_stage_2":
         strategy = pl.strategies.DeepSpeedStrategy(
             stage=2, 
+            # stage=3, zero3_init_flag=True,
             loss_scale=cfg.fp16_loss_scale, logging_batch_size_per_gpu=cfg.data_module.batch_size
         )
-    elif cfg.strategy == "deepspeed_stage_3":
-        strategy = DeepSpeedStrategy(
-            stage=3,
-            zero3_init_flag=True,
-            loss_scale=cfg.fp16_loss_scale,
-            logging_batch_size_per_gpu=cfg.data_module.batch_size,
-        )
-    elif cfg.strategy == "deepspeed_config":
-        strategy = DeepSpeedStrategy(config=cfg.deepspeed_config)
-    elif cfg.strategy == "fsdp_full_shard":
-        strategy = FSDPStrategy(
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy="TRANSFORMER_BASED_WRAP", 
-            cpu_offload=False,
-            limit_all_gathers=True,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            use_orig_params=True,
-        )
-    else:
-        strategy = None
 
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=-1,
-        monitor=None,
+    sim_ckpt = SimlingoCompatibleCheckpoint(
         dirpath="./checkpoints",
-        filename="{epoch:03d}",
-        save_last=True,
         every_n_epochs=cfg.val_every_n_epochs,
-        # every_n_train_steps=cfg.val_check_interval,
+        save_last=True,
     )
 
     lr_monitor = LearningRateMonitor(logging_interval='step')
     model_summary = ModelSummary(max_depth=3)
     callbacks=[
-        checkpoint_callback, 
-        model_summary, 
-        # ThroughputMonitor(batch_size_fn=lambda batch: batch.driving_input.camera_images.size(0)), 
+        sim_ckpt,
+        model_summary,
         VisualiseCallback(interval=1000)
     ]
     if not cfg.debug: 
         callbacks.append(lr_monitor)
     
     print(f"Number of GPUS: {cfg.gpus}")
+    overfit = 0
     
     if cfg.gpus >= 1:
         trainer = Trainer(
@@ -151,7 +153,7 @@ def main(cfg: TrainConfig):
             benchmark=True,
             callbacks=callbacks,
             devices=cfg.gpus,
-            enable_checkpointing=True,
+            enable_checkpointing=False,
             gradient_clip_val=1.0,
             log_every_n_steps=20,
             logger=loggers,
